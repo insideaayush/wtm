@@ -397,19 +397,35 @@ func storeRootPath(repoRoot string, worktree gitx.Worktree) (string, error) {
 	if repoSlug == "" {
 		repoSlug = "repo"
 	}
-	wtSlug := sanitizeName(worktreeSlug(repoRoot, worktree))
-	if wtSlug == "" {
-		wtSlug = "worktree"
+	segments := worktreePathSegments(repoRoot, worktree)
+	if len(segments) == 0 {
+		segments = []string{"worktree"}
 	}
-	return filepath.Join(home, storeRootDir, storeSubDir, repoSlug, wtSlug), nil
+	parts := append([]string{home, storeRootDir, storeSubDir, repoSlug}, segments...)
+	return filepath.Join(parts...), nil
 }
 
-func worktreeSlug(repoRoot string, worktree gitx.Worktree) string {
+func worktreePathSegments(repoRoot string, worktree gitx.Worktree) []string {
 	rel, err := filepath.Rel(repoRoot, worktree.Path)
 	if err == nil && rel != "" && rel != "." {
-		return rel
+		return sanitizeSegments(strings.Split(filepath.ToSlash(rel), "/"))
 	}
-	return worktree.Path
+	return sanitizeSegments(splitPathComponents(worktree.Path))
+}
+
+func splitPathComponents(path string) []string {
+	if path == "" {
+		return nil
+	}
+	segments := strings.Split(filepath.ToSlash(path), "/")
+	o := make([]string, 0, len(segments))
+	for _, seg := range segments {
+		if seg == "" || seg == "." {
+			continue
+		}
+		o = append(o, seg)
+	}
+	return o
 }
 
 func sanitizeName(s string) string {
@@ -423,6 +439,20 @@ func sanitizeName(s string) string {
 		}
 	}
 	return strings.Trim(b.String(), "_ ")
+}
+
+func sanitizeSegments(parts []string) []string {
+	out := make([]string, 0, len(parts))
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		if sanitized := sanitizeName(part); sanitized != "" {
+			out = append(out, sanitized)
+		}
+	}
+	return out
 }
 
 func normalizePatterns(in []string) []string {
