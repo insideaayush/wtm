@@ -10,13 +10,18 @@ import (
 
 func main() {
 	if len(os.Args) < 2 {
-		fmt.Fprintln(os.Stderr, "usage: wtm <sync|version> [options]")
+		fmt.Fprintln(os.Stderr, "usage: wtm <sync|push|version> [options]")
 		os.Exit(2)
 	}
 
 	switch os.Args[1] {
 	case "sync":
 		if err := sync.Run(os.Args[2:]); err != nil {
+			fmt.Fprintln(os.Stderr, err.Error())
+			os.Exit(1)
+		}
+	case "push":
+		if err := sync.Push(os.Args[2:]); err != nil {
 			fmt.Fprintln(os.Stderr, err.Error())
 			os.Exit(1)
 		}

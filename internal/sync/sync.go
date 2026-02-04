@@ -18,14 +18,28 @@ import (
 	"github.com/bmatcuk/doublestar/v4"
 )
 
+const (
+	storeRootDir = ".wtm"
+	storeSubDir  = "configs"
+)
+
 type planItem struct {
-	srcAbs string
-	rel    string // slash-separated
-	dstAbs string
+	rel         string
+	repoAbs     string
+	storeAbs    string
+	worktreeAbs string
 }
 
 type skipError struct {
 	dst string
+}
+
+type syncOptions struct {
+	repoHint     string
+	worktreeNum  int
+	destOverride string
+	yes          bool
+	force        bool
 }
 
 func (e skipError) Error() string {
@@ -33,26 +47,12 @@ func (e skipError) Error() string {
 }
 
 func Run(args []string) error {
-	fsFlags := flag.NewFlagSet("sync", flag.ContinueOnError)
-	fsFlags.SetOutput(io.Discard) // we'll print our own usage/errors
-
-	var repoHint string
-	var worktreeNum int
-	var destOverride string
-	var yes bool
-	var force bool
-
-	fsFlags.StringVar(&repoHint, "repo", "", "repo path (defaults to current dir repo)")
-	fsFlags.IntVar(&worktreeNum, "worktree", 0, "worktree number (1-indexed)")
-	fsFlags.StringVar(&destOverride, "dest", "", "destination worktree path")
-	fsFlags.BoolVar(&yes, "yes", false, "skip global proceed confirmation")
-	fsFlags.BoolVar(&force, "force", false, "overwrite files without per-file prompting")
-
-	if err := fsFlags.Parse(args); err != nil {
-		return usageError(err)
+	opts, err := parseOptions("sync", args)
+	if err != nil {
+		return usageError("sync", err)
 	}
 
-	repoRoot, err := gitx.RepoRoot(repoHint)
+	repoRoot, err := gitx.RepoRoot(opts.repoHint)
 	if err != nil {
 		return err
 	}
@@ -62,10 +62,11 @@ func Run(args []string) error {
 		return err
 	}
 
-	destRoot, err := pickWorktree(repoRoot, wts, destOverride, worktreeNum)
+	worktree, err := pickWorktree(repoRoot, wts, opts.destOverride, opts.worktreeNum)
 	if err != nil {
 		return err
 	}
+	destRoot := worktree.Path
 	if samePath(repoRoot, destRoot) {
 		return fmt.Errorf("selected worktree is the current repo root; nothing to sync")
 	}
@@ -75,19 +76,24 @@ func Run(args []string) error {
 		return err
 	}
 
-	plan, err := buildPlan(repoRoot, destRoot, loaded.Config)
+	storeRoot, err := storeRootPath(repoRoot, worktree)
 	if err != nil {
 		return err
 	}
 
-	printWork(repoRoot, destRoot, loaded.Source, plan)
+	plan, err := buildSyncPlan(repoRoot, destRoot, storeRoot, loaded.Config)
+	if err != nil {
+		return err
+	}
+
+	printSyncPlan(repoRoot, destRoot, storeRoot, loaded.Source, plan)
 
 	if len(plan) == 0 {
 		fmt.Fprintln(os.Stderr, "No files matched; nothing to do.")
 		return nil
 	}
 
-	if !yes {
+	if !opts.yes {
 		if !confirm("Proceed? [y/N] ") {
 			fmt.Fprintln(os.Stderr, "Aborted.")
 			return nil
@@ -95,52 +101,155 @@ func Run(args []string) error {
 	}
 
 	copied := 0
+	linked := 0
 	skipped := 0
 
 	for _, it := range plan {
-		if err := copyOne(it.srcAbs, it.dstAbs, force); err != nil {
-			// Non-fatal: keep going but report.
+		if err := copyRepoToStore(it.repoAbs, it.storeAbs); err != nil {
+			fmt.Fprintln(os.Stderr, "Error copying to store:", err)
+			skipped++
+			continue
+		}
+		copied++
+
+		if err := ensureWorktreeLink(it.storeAbs, it.worktreeAbs, opts.force); err != nil {
 			var se skipError
 			if errors.As(err, &se) {
 				fmt.Fprintln(os.Stderr, "Skipped:", se.dst)
 				skipped++
 				continue
 			}
-			fmt.Fprintln(os.Stderr, "Error:", err.Error())
+			fmt.Fprintln(os.Stderr, "Error symlinking:", err)
 			skipped++
 			continue
 		}
-		copied++
+		linked++
 	}
 
-	fmt.Fprintf(os.Stderr, "Done. Copied: %d, skipped: %d\n", copied, skipped)
+	fmt.Fprintf(os.Stderr, "Done. Copied into store: %d, linked: %d, skipped: %d\n", copied, linked, skipped)
 	return nil
 }
 
-func usageError(err error) error {
+func Push(args []string) error {
+	opts, err := parseOptions("push", args)
+	if err != nil {
+		return usageError("push", err)
+	}
+
+	repoRoot, err := gitx.RepoRoot(opts.repoHint)
+	if err != nil {
+		return err
+	}
+
+	wts, err := gitx.ListWorktrees(repoRoot)
+	if err != nil {
+		return err
+	}
+
+	worktree, err := pickWorktree(repoRoot, wts, opts.destOverride, opts.worktreeNum)
+	if err != nil {
+		return err
+	}
+
+	loaded, err := config.Load(repoRoot)
+	if err != nil {
+		return err
+	}
+
+	storeRoot, err := storeRootPath(repoRoot, worktree)
+	if err != nil {
+		return err
+	}
+
+	if _, err := os.Stat(storeRoot); err != nil {
+		if os.IsNotExist(err) {
+			return fmt.Errorf("store %s does not exist; run \"wtm sync\" first", storeRoot)
+		}
+		return err
+	}
+
+	plan, err := buildPushPlan(storeRoot, repoRoot, loaded.Config)
+	if err != nil {
+		return err
+	}
+
+	printPushPlan(repoRoot, storeRoot, loaded.Source, plan)
+
+	if len(plan) == 0 {
+		fmt.Fprintln(os.Stderr, "No files in store match the configured include/exclude patterns.")
+		return nil
+	}
+
+	if !opts.yes {
+		if !confirm("Proceed? [y/N] ") {
+			fmt.Fprintln(os.Stderr, "Aborted.")
+			return nil
+		}
+	}
+
+	pushed := 0
+	skipped := 0
+
+	for _, it := range plan {
+		if err := copyStoreToRepo(it.storeAbs, it.repoAbs, opts.force); err != nil {
+			var se skipError
+			if errors.As(err, &se) {
+				fmt.Fprintln(os.Stderr, "Skipped:", se.dst)
+				skipped++
+				continue
+			}
+			fmt.Fprintln(os.Stderr, "Error copying from store:", err)
+			skipped++
+			continue
+		}
+		pushed++
+	}
+
+	fmt.Fprintf(os.Stderr, "Done. Pushed %d files to repo, skipped %d.\n", pushed, skipped)
+	return nil
+}
+
+func parseOptions(command string, args []string) (syncOptions, error) {
+	fsFlags := flag.NewFlagSet(command, flag.ContinueOnError)
+	fsFlags.SetOutput(io.Discard)
+
+	var opts syncOptions
+	fsFlags.StringVar(&opts.repoHint, "repo", "", "repo path (defaults to current dir repo)")
+	fsFlags.IntVar(&opts.worktreeNum, "worktree", 0, "worktree number (1-indexed)")
+	fsFlags.StringVar(&opts.destOverride, "dest", "", "destination worktree path")
+	fsFlags.BoolVar(&opts.yes, "yes", false, "skip global proceed confirmation")
+	fsFlags.BoolVar(&opts.force, "force", false, "overwrite files without per-file prompting")
+
+	if err := fsFlags.Parse(args); err != nil {
+		return syncOptions{}, err
+	}
+	return opts, nil
+}
+
+func usageError(command string, err error) error {
 	msg := strings.TrimSpace(err.Error())
 	if msg != "" {
 		fmt.Fprintln(os.Stderr, "Error:", msg)
 	}
-	fmt.Fprintln(os.Stderr, "usage: wtm sync [--repo PATH] [--worktree N | --dest PATH] [--yes] [--force]")
+	fmt.Fprintf(os.Stderr, "usage: wtm %s [--repo PATH] [--worktree N | --dest PATH] [--yes] [--force]\n", command)
 	return fmt.Errorf("invalid arguments")
 }
 
-func pickWorktree(repoRoot string, wts []gitx.Worktree, destOverride string, worktreeNum int) (string, error) {
+func pickWorktree(repoRoot string, wts []gitx.Worktree, destOverride string, worktreeNum int) (gitx.Worktree, error) {
 	if destOverride != "" {
 		for _, wt := range wts {
 			if samePath(wt.Path, destOverride) {
-				return wt.Path, nil
+				return wt, nil
 			}
 		}
-		return "", fmt.Errorf("--dest did not match an active worktree path: %s", destOverride)
+		return gitx.Worktree{}, fmt.Errorf("--dest did not match an active worktree path: %s", destOverride)
 	}
 
 	if worktreeNum != 0 {
 		if worktreeNum < 1 || worktreeNum > len(wts) {
-			return "", fmt.Errorf("--worktree must be between 1 and %d", len(wts))
+			return gitx.Worktree{}, fmt.Errorf("--worktree must be between 1 and %d", len(wts))
 		}
-		return wts[worktreeNum-1].Path, nil
+		return wts[worktreeNum-1], nil
 	}
 
 	fmt.Fprintln(os.Stderr, "Active worktrees:")
@@ -160,15 +269,16 @@ func pickWorktree(repoRoot string, wts []gitx.Worktree, destOverride string, wor
 		s := prompt("Select worktree number to sync into: ")
 		n, err := strconv.Atoi(strings.TrimSpace(s))
 		if err == nil && n >= 1 && n <= len(wts) {
-			return wts[n-1].Path, nil
+			return wts[n-1], nil
 		}
 		fmt.Fprintf(os.Stderr, "Invalid selection. Enter a number between 1 and %d.\n", len(wts))
 	}
 }
 
-func buildPlan(repoRoot, destRoot string, cfg config.Config) ([]planItem, error) {
+func buildSyncPlan(repoRoot, worktreeRoot, storeRoot string, cfg config.Config) ([]planItem, error) {
 	repoRoot = filepath.Clean(repoRoot)
-	destRoot = filepath.Clean(destRoot)
+	worktreeRoot = filepath.Clean(worktreeRoot)
+	storeRoot = filepath.Clean(storeRoot)
 
 	include := normalizePatterns(cfg.Include)
 	exclude := normalizePatterns(cfg.Exclude)
@@ -179,8 +289,6 @@ func buildPlan(repoRoot, destRoot string, cfg config.Config) ([]planItem, error)
 		if err != nil {
 			return err
 		}
-
-		// Cheap fast-path skips for huge dirs.
 		if d.IsDir() {
 			name := d.Name()
 			if name == ".git" || name == "node_modules" {
@@ -188,39 +296,133 @@ func buildPlan(repoRoot, destRoot string, cfg config.Config) ([]planItem, error)
 			}
 			return nil
 		}
-
 		relOS, err := filepath.Rel(repoRoot, path)
 		if err != nil {
 			return err
 		}
 		rel := filepath.ToSlash(relOS)
-
-		if !matchesAny(include, rel) {
+		if !matchesAny(include, rel) || matchesAny(exclude, rel) {
 			return nil
 		}
-		if matchesAny(exclude, rel) {
+		dest := filepath.Join(worktreeRoot, relOS)
+		if samePath(path, dest) {
 			return nil
 		}
-
-		dst := filepath.Join(destRoot, relOS)
-		if samePath(path, dst) {
-			return nil
-		}
-
+		store := filepath.Join(storeRoot, relOS)
 		items = append(items, planItem{
-			srcAbs: path,
-			rel:    rel,
-			dstAbs: dst,
+			rel:         rel,
+			repoAbs:     path,
+			storeAbs:    store,
+			worktreeAbs: dest,
 		})
 		return nil
 	})
 	if err != nil {
 		return nil, err
 	}
-
-	// Stable order for predictable previews.
 	sortPlan(items)
 	return items, nil
+}
+
+func buildPushPlan(storeRoot, repoRoot string, cfg config.Config) ([]planItem, error) {
+	repoRoot = filepath.Clean(repoRoot)
+	storeRoot = filepath.Clean(storeRoot)
+
+	include := normalizePatterns(cfg.Include)
+	exclude := normalizePatterns(cfg.Exclude)
+
+	var items []planItem
+
+	err := filepath.WalkDir(storeRoot, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			name := d.Name()
+			if name == ".git" || name == "node_modules" {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		relOS, err := filepath.Rel(storeRoot, path)
+		if err != nil {
+			return err
+		}
+		rel := filepath.ToSlash(relOS)
+		if !matchesAny(include, rel) || matchesAny(exclude, rel) {
+			return nil
+		}
+		repo := filepath.Join(repoRoot, relOS)
+		items = append(items, planItem{
+			rel:      rel,
+			repoAbs:  repo,
+			storeAbs: path,
+		})
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	sortPlan(items)
+	return items, nil
+}
+
+func printSyncPlan(repoRoot, worktreeRoot, storeRoot, configSource string, plan []planItem) {
+	fmt.Fprintln(os.Stderr, "Repo:", repoRoot)
+	fmt.Fprintln(os.Stderr, "Worktree:", worktreeRoot)
+	fmt.Fprintln(os.Stderr, "Store:", storeRoot)
+	fmt.Fprintln(os.Stderr, "Config:", configSource)
+	fmt.Fprintf(os.Stderr, "Planned entries: %d\n", len(plan))
+	for _, it := range plan {
+		fmt.Fprintf(os.Stdout, "%s -> %s -> %s\n", it.repoAbs, it.storeAbs, it.worktreeAbs)
+	}
+}
+
+func printPushPlan(repoRoot, storeRoot, configSource string, plan []planItem) {
+	fmt.Fprintln(os.Stderr, "Repo:", repoRoot)
+	fmt.Fprintln(os.Stderr, "Store:", storeRoot)
+	fmt.Fprintln(os.Stderr, "Config:", configSource)
+	fmt.Fprintf(os.Stderr, "Planned entries: %d\n", len(plan))
+	for _, it := range plan {
+		fmt.Fprintf(os.Stdout, "%s -> %s\n", it.storeAbs, it.repoAbs)
+	}
+}
+
+func storeRootPath(repoRoot string, worktree gitx.Worktree) (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("home dir: %w", err)
+	}
+	repoSlug := sanitizeName(filepath.Base(repoRoot))
+	if repoSlug == "" {
+		repoSlug = "repo"
+	}
+	wtSlug := sanitizeName(worktreeSlug(repoRoot, worktree))
+	if wtSlug == "" {
+		wtSlug = "worktree"
+	}
+	return filepath.Join(home, storeRootDir, storeSubDir, repoSlug, wtSlug), nil
+}
+
+func worktreeSlug(repoRoot string, worktree gitx.Worktree) string {
+	rel, err := filepath.Rel(repoRoot, worktree.Path)
+	if err == nil && rel != "" && rel != "." {
+		return rel
+	}
+	return worktree.Path
+}
+
+func sanitizeName(s string) string {
+	var b strings.Builder
+	for _, r := range s {
+		switch {
+		case r == filepath.Separator || r == '/' || r == '\\' || r == ' ' || r == ':' || r == '\t':
+			b.WriteRune('_')
+		default:
+			b.WriteRune(r)
+		}
+	}
+	return strings.Trim(b.String(), "_ ")
 }
 
 func normalizePatterns(in []string) []string {
@@ -246,8 +448,6 @@ func matchesAny(patterns []string, rel string) bool {
 }
 
 func sortPlan(items []planItem) {
-	// Avoid pulling in a dependency; simple insertion sort is fine for small lists.
-	// If this grows large, we can switch to sort.Slice.
 	for i := 1; i < len(items); i++ {
 		j := i
 		for j > 0 && items[j-1].rel > items[j].rel {
@@ -257,14 +457,92 @@ func sortPlan(items []planItem) {
 	}
 }
 
-func printWork(repoRoot, destRoot, configSource string, plan []planItem) {
-	fmt.Fprintln(os.Stderr, "Repo:", repoRoot)
-	fmt.Fprintln(os.Stderr, "Dest:", destRoot)
-	fmt.Fprintln(os.Stderr, "Config:", configSource)
-	fmt.Fprintf(os.Stderr, "Planned copies: %d\n", len(plan))
-	for _, it := range plan {
-		fmt.Fprintf(os.Stdout, "%s -> %s\n", it.srcAbs, it.dstAbs)
+func copyRepoToStore(src, dst string) error {
+	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+		return fmt.Errorf("mkdir %s: %w", filepath.Dir(dst), err)
 	}
+	return copyFileContents(src, dst)
+}
+
+func copyStoreToRepo(src, dst string, force bool) error {
+	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+		return fmt.Errorf("mkdir %s: %w", filepath.Dir(dst), err)
+	}
+	if err := handleExisting(dst, force); err != nil {
+		return err
+	}
+	return copyFileContents(src, dst)
+}
+
+func handleExisting(path string, force bool) error {
+	if _, err := os.Lstat(path); err == nil {
+		if !force {
+			if !confirm(fmt.Sprintf("Overwrite %s? [y/N] ", path)) {
+				return skipError{dst: path}
+			}
+		}
+		if err := os.Remove(path); err != nil {
+			return fmt.Errorf("remove %s: %w", path, err)
+		}
+	} else if err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("stat %s: %w", path, err)
+	}
+	return nil
+}
+
+func copyFileContents(src, dst string) error {
+	srcInfo, err := os.Stat(src)
+	if err != nil {
+		return fmt.Errorf("stat %s: %w", src, err)
+	}
+	in, err := os.Open(src)
+	if err != nil {
+		return fmt.Errorf("open %s: %w", src, err)
+	}
+	defer in.Close()
+	out, err := os.Create(dst)
+	if err != nil {
+		return fmt.Errorf("create %s: %w", dst, err)
+	}
+	defer func() {
+		_ = out.Close()
+	}()
+	if _, err := io.Copy(out, in); err != nil {
+		return fmt.Errorf("copy %s -> %s: %w", src, dst, err)
+	}
+	if err := out.Close(); err != nil {
+		return fmt.Errorf("close %s: %w", dst, err)
+	}
+	if err := os.Chmod(dst, srcInfo.Mode()); err != nil {
+		return fmt.Errorf("chmod %s: %w", dst, err)
+	}
+	mtime := srcInfo.ModTime()
+	atime := time.Now()
+	_ = os.Chtimes(dst, atime, mtime)
+	return nil
+}
+
+func ensureWorktreeLink(target, link string, force bool) error {
+	if err := os.MkdirAll(filepath.Dir(link), 0o755); err != nil {
+		return fmt.Errorf("mkdir %s: %w", filepath.Dir(link), err)
+	}
+	if info, err := os.Lstat(link); err == nil {
+		if info.Mode()&os.ModeSymlink != 0 {
+			current, err := os.Readlink(link)
+			if err == nil && current == target {
+				return nil
+			}
+		}
+		if err := handleExisting(link, force); err != nil {
+			return err
+		}
+	} else if err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("stat %s: %w", link, err)
+	}
+	if err := os.Symlink(target, link); err != nil {
+		return fmt.Errorf("symlink %s -> %s: %w", link, target, err)
+	}
+	return nil
 }
 
 func prompt(msg string) string {
@@ -279,61 +557,8 @@ func confirm(msg string) bool {
 	return s == "y" || s == "yes"
 }
 
-func copyOne(src, dst string, force bool) error {
-	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
-		return fmt.Errorf("mkdir %s: %w", filepath.Dir(dst), err)
-	}
-
-	if _, err := os.Stat(dst); err == nil {
-		if !force {
-			if !confirm(fmt.Sprintf("Overwrite %s? [y/N] ", dst)) {
-				return skipError{dst: dst}
-			}
-		}
-	} else if err != nil && !os.IsNotExist(err) {
-		return fmt.Errorf("stat %s: %w", dst, err)
-	}
-
-	srcInfo, err := os.Stat(src)
-	if err != nil {
-		return fmt.Errorf("stat %s: %w", src, err)
-	}
-
-	in, err := os.Open(src)
-	if err != nil {
-		return fmt.Errorf("open %s: %w", src, err)
-	}
-	defer in.Close()
-
-	out, err := os.Create(dst)
-	if err != nil {
-		return fmt.Errorf("create %s: %w", dst, err)
-	}
-	defer func() {
-		_ = out.Close()
-	}()
-
-	if _, err := io.Copy(out, in); err != nil {
-		return fmt.Errorf("copy %s -> %s: %w", src, dst, err)
-	}
-	if err := out.Close(); err != nil {
-		return fmt.Errorf("close %s: %w", dst, err)
-	}
-
-	if err := os.Chmod(dst, srcInfo.Mode()); err != nil {
-		return fmt.Errorf("chmod %s: %w", dst, err)
-	}
-
-	mtime := srcInfo.ModTime()
-	atime := time.Now()
-	_ = os.Chtimes(dst, atime, mtime) // best-effort
-
-	return nil
-}
-
 func samePath(a, b string) bool {
 	aa := filepath.Clean(a)
 	bb := filepath.Clean(b)
 	return aa == bb
 }
-
