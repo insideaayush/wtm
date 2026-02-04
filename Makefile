@@ -78,21 +78,21 @@ clean-release:
 	@rm -rf $(RELEASE_DIR)
 
 release: build-release
-	@if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-		printf 'git repository required for release\n'
-		exit 1
+	@if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then \
+		printf 'git repository required for release\n'; \
+		exit 1; \
 	fi
-	@if ! git diff --quiet; then
-		printf 'clean working tree required for release\n'
-		exit 1
+	@if ! git diff --quiet; then \
+		printf 'clean working tree required for release\n'; \
+		exit 1; \
 	fi
 	@tag=v$(VERSION)
 	@echo "Tagging $$tag"
 	@git tag -a "$$tag" -m "Release $$tag"
 	@git push origin "$$tag"
-	@if ! command -v gh >/dev/null 2>&1; then
-		printf 'gh CLI not found; create release manually with artifacts in $(RELEASE_DIR)\n'
-		exit 1
+	@if ! command -v gh >/dev/null 2>&1; then \
+		printf 'gh CLI not found; create release manually with artifacts in $(RELEASE_DIR)\n'; \
+		exit 1; \
 	fi
 	@echo "Creating GitHub release for $$tag"
 	@gh release create "$$tag" --title "wtm $$tag" --notes "Release $$tag" $(RELEASE_ARTIFACTS)
