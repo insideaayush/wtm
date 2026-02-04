@@ -9,6 +9,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -88,6 +89,10 @@ func Run(args []string) error {
 
 	printSyncPlan(repoRoot, destRoot, storeRoot, loaded.Source, plan)
 
+	plan, err = choosePlanEntries(plan, opts.yes, "sync")
+	if err != nil {
+		return err
+	}
 	if len(plan) == 0 {
 		fmt.Fprintln(os.Stderr, "No files matched; nothing to do.")
 		return nil
@@ -175,6 +180,10 @@ func Push(args []string) error {
 
 	printPushPlan(repoRoot, storeRoot, loaded.Source, plan)
 
+	plan, err = choosePlanEntries(plan, opts.yes, "push")
+	if err != nil {
+		return err
+	}
 	if len(plan) == 0 {
 		fmt.Fprintln(os.Stderr, "No files in store match the configured include/exclude patterns.")
 		return nil
@@ -373,8 +382,8 @@ func printSyncPlan(repoRoot, worktreeRoot, storeRoot, configSource string, plan 
 	fmt.Fprintln(os.Stderr, "Store:", storeRoot)
 	fmt.Fprintln(os.Stderr, "Config:", configSource)
 	fmt.Fprintf(os.Stderr, "Planned entries: %d\n", len(plan))
-	for _, it := range plan {
-		fmt.Fprintf(os.Stdout, "%s -> %s -> %s\n", it.repoAbs, it.storeAbs, it.worktreeAbs)
+	for i, it := range plan {
+		fmt.Fprintf(os.Stdout, "[%d] %s -> %s -> %s\n", i+1, it.repoAbs, it.storeAbs, it.worktreeAbs)
 	}
 }
 
@@ -383,9 +392,61 @@ func printPushPlan(repoRoot, storeRoot, configSource string, plan []planItem) {
 	fmt.Fprintln(os.Stderr, "Store:", storeRoot)
 	fmt.Fprintln(os.Stderr, "Config:", configSource)
 	fmt.Fprintf(os.Stderr, "Planned entries: %d\n", len(plan))
-	for _, it := range plan {
-		fmt.Fprintf(os.Stdout, "%s -> %s\n", it.storeAbs, it.repoAbs)
+	for i, it := range plan {
+		fmt.Fprintf(os.Stdout, "[%d] %s -> %s\n", i+1, it.storeAbs, it.repoAbs)
 	}
+}
+
+func choosePlanEntries(plan []planItem, yes bool, action string) ([]planItem, error) {
+	if yes || len(plan) == 0 {
+		return plan, nil
+	}
+	for {
+		msg := fmt.Sprintf("Select entries to %s (numbers, comma/space separated; empty/all = everything): ", action)
+		input := prompt(msg)
+		trimmed := strings.TrimSpace(input)
+		if trimmed == "" || strings.EqualFold(trimmed, "all") {
+			return plan, nil
+		}
+		indices, err := parseSelection(trimmed, len(plan))
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			continue
+		}
+		if len(indices) == 0 {
+			fmt.Fprintln(os.Stderr, "No entries selected; please try again.")
+			continue
+		}
+		selected := make([]planItem, len(indices))
+		for i, idx := range indices {
+			selected[i] = plan[idx]
+		}
+		return selected, nil
+	}
+}
+
+func parseSelection(input string, max int) ([]int, error) {
+	normalized := strings.ReplaceAll(input, ",", " ")
+	fields := strings.Fields(normalized)
+	if len(fields) == 0 {
+		return nil, fmt.Errorf("no entries parsed")
+	}
+	seen := make(map[int]struct{})
+	out := make([]int, 0, len(fields))
+	for _, token := range fields {
+		n, err := strconv.Atoi(token)
+		if err != nil || n < 1 || n > max {
+			return nil, fmt.Errorf("invalid entry %q", token)
+		}
+		idx := n - 1
+		if _, ok := seen[idx]; ok {
+			continue
+		}
+		seen[idx] = struct{}{}
+		out = append(out, idx)
+	}
+	sort.Ints(out)
+	return out, nil
 }
 
 func storeRootPath(repoRoot string, worktree gitx.Worktree) (string, error) {
